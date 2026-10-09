@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from eventhub.config import settings
 from eventhub.db import Session, engine
-from eventhub.models import Workspace, ChannelConnection, ServiceEndpoint, EventRoute
+from eventhub.models import Workspace, ChannelConnection, ServiceEndpoint, EventRoute, EventRecord, EventDelivery
 from eventhub.core import publish, queue_outbound, resolve_secret
 from eventhub.adapters.telegram import TelegramAdapter
 
@@ -48,6 +48,12 @@ class RouteIn(BaseModel):
     service_id: uuid.UUID
     connection_id: uuid.UUID | None = None
     event_type: str
+
+class ServiceReplyIn(BaseModel):
+    # Narrow-scoped business reply: one response per event/service.
+    event_id: uuid.UUID
+    service_key: str = Field(min_length=2, max_length=100)
+    text: str = Field(min_length=1, max_length=4000)
 
 class IngestIn(BaseModel):
     connection_id: uuid.UUID
@@ -133,6 +139,57 @@ async def enqueue_outbound(body: OutboundIn):
         oid, created = await queue_outbound(session, connection, body.idempotency_key,
                                             body.command_type, body.target, body.payload)
         return {"command_id": str(oid), "created": created}
+
+@app.post("/v1/service-replies")
+async def create_service_reply(body: ServiceReplyIn, x_hub_key: str | None = Header(default=None)):
+    """Allow a routed service to reply once to an event, without ADMIN_API_KEY.
+
+    Authentication uses the service's existing callback secret (X-Hub-Key).
+    The target conversation and connection are always derived from the event,
+    preventing arbitrary chat_id or connection selection by a business service.
+    """
+    import hmac
+    if not x_hub_key:
+        raise HTTPException(403, "Forbidden")
+    async with Session.begin() as session:
+        event = await session.get(EventRecord, body.event_id)
+        if not event:
+            raise HTTPException(404, "Event not found")
+        service = (await session.execute(
+            select(ServiceEndpoint)
+            .join(EventDelivery, EventDelivery.service_id == ServiceEndpoint.id)
+            .where(
+                EventDelivery.event_id == event.id,
+                ServiceEndpoint.workspace_id == event.workspace_id,
+                ServiceEndpoint.service_key == body.service_key,
+                ServiceEndpoint.is_enabled.is_(True),
+            )
+            .limit(1)
+        )).scalar_one_or_none()
+        if not service:
+            raise HTTPException(403, "Service has no delivery for this event")
+        try:
+            expected = resolve_secret(service.auth_secret_ref)
+        except ValueError:
+            raise HTTPException(503, "Service verification unavailable")
+        if not hmac.compare_digest(expected, x_hub_key):
+            raise HTTPException(403, "Forbidden")
+        if event.event_type != "message.received":
+            raise HTTPException(422, "Only message.received can be replied to")
+        conversation_id = event.payload.get("conversation_id")
+        if not conversation_id:
+            raise HTTPException(422, "Event has no conversation_id")
+        connection = await session.get(ChannelConnection, event.connection_id)
+        if not connection or not connection.is_enabled:
+            raise HTTPException(404, "Connection unavailable")
+        command_id, created = await queue_outbound(
+            session, connection,
+            f"service-reply:{service.id}:{event.id}",
+            "message.send",
+            {"conversation_id": str(conversation_id)},
+            {"text": body.text},
+        )
+        return {"command_id": str(command_id), "created": created}
 
 @app.post("/v1/webhooks/telegram/{connection_id}")
 async def telegram_webhook(connection_id: uuid.UUID, request: Request,
