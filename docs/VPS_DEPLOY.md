@@ -51,17 +51,49 @@ dig +short @evo-cns01.cloud.ru proxy.handyman.moscow A
 
 ## 4. Загрузка проекта и секреты
 
-Репозиторий приватный, поэтому клонирование требует авторизации GitHub (SSH-ключ или credential manager).
+Репозиторий приватный, поэтому клонирование требует авторизации GitHub. На VPS используется отдельный **read-only Deploy Key** (`~/.ssh/id_ed25519_eventhub`), предварительно добавленный в GitHub → Settings → Deploy keys. Если репозиторий уже клонирован, повторять `git clone` не нужно.
 
 ```bash
-git clone git@github.com:glazole/messaging-event-hub.git
-cd messaging-event-hub
-cp .env.example .env
+# Проверка имеющегося Deploy Key.
+ssh -i ~/.ssh/id_ed25519_eventhub -o IdentitiesOnly=yes -T git@github.com
+
+# Только на новом сервере: клонирование приватного репозитория.
+GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_eventhub -o IdentitiesOnly=yes" \
+  git clone git@github.com:glazole/messaging-event-hub.git
+
+cd ~/messaging-event-hub
+
+# Настроить один раз для данного репозитория: после этого достаточно обычного git pull.
+git config --local core.sshCommand \
+  "ssh -i $HOME/.ssh/id_ed25519_eventhub -o IdentitiesOnly=yes"
+git config --local --get core.sshCommand
+git pull origin main
+```
+
+`core.sshCommand` хранится в локальном `.git/config` и не меняет SSH-настройки других репозиториев. Если Deploy Key ещё не создан, сначала создайте его через `ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_eventhub` и загрузите **только публичный** `.pub`-ключ в GitHub.
+
+Создайте файл окружения (существующий `.env` не перезаписываем) и сгенерируйте четыре разных секрета:
+
+```bash
+test -f .env || cp .env.example .env
 chmod 600 .env
+
+python3 - <<'PY'
+import secrets
+
+for name in [
+    "POSTGRES_PASSWORD",
+    "ADMIN_API_KEY",
+    "CALLBACK_SHARED_KEY",
+    "TELEGRAM_WEBHOOK_SECRET",
+]:
+    print(f"{name}={secrets.token_hex(24)}")
+PY
+
 nano .env
 ```
 
-В `.env` укажите **разные** длинные случайные секреты для `POSTGRES_PASSWORD`, `ADMIN_API_KEY`, `TELEGRAM_WEBHOOK_SECRET`. Пароль PostgreSQL в `DATABASE_URL` должен совпадать с `POSTGRES_PASSWORD`; спецсимволы URL-кодируются. Для Telegram задайте `TELEGRAM_BOT_TOKEN`. Не помещайте токены в GitHub или чаты.
+Python-команда **только выводит** новые значения; скопируйте их в `.env` вручную. `POSTGRES_PASSWORD` должен совпадать с паролем в `DATABASE_URL` (спецсимволы URL-кодируются); `ADMIN_API_KEY` защищает административный API, `CALLBACK_SHARED_KEY` — обращения к Demo Consumer, `TELEGRAM_WEBHOOK_SECRET` — входящий webhook. Токен `TELEGRAM_BOT_TOKEN` получите отдельно через BotFather. Если переменные Telegram в исходном `.env.example` закомментированы, раскомментируйте их в `.env`. Не помещайте секреты в GitHub или чаты.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.vps.yml config --quiet
@@ -81,6 +113,15 @@ curl -fsS http://127.0.0.1:8000/health/ready
 curl -I https://proxy.handyman.moscow/
 ```
 
+Caddy получает и продлевает TLS-сертификат автоматически. Публичный `POST /v1/webhooks/telegram/*` проксируется в `api:8000`, остальные публичные пути возвращают 404. Правила находятся в [`deploy/Caddyfile`](../deploy/Caddyfile).
+
+Проверьте, что Alembic создал семь прикладных таблиц ядра и восьмую служебную `alembic_version`:
+
+```bash
+docker compose exec postgres sh -c \
+'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\dt relay.*"'
+```
+
 ## 5. Безопасный доступ к Swagger/API из своего компьютера
 
 Используйте существующий Tailscale + SSH, не публикуя админку. На **своём компьютере**:
@@ -91,11 +132,31 @@ ssh -L 8000:127.0.0.1:8000 glazole@TAILSCALE_VPS_IP
 
 Откройте на компьютере `http://127.0.0.1:8000/docs` — туннель защищён SSH и Tailscale. Используйте HTTP заголовок `X-Admin-Key` из .env. Если локальный порт 8000 занят, замените первую 8000 на 18000 и откройте localhost:18000.
 
-В API создайте workspace, Telegram connection, service и route по README. `credential_ref` = `env://TELEGRAM_BOT_TOKEN`, `webhook_secret_ref` = `env://TELEGRAM_WEBHOOK_SECRET`. Сохраните UUID connection.
+В API можно вручную создать workspace, Telegram connection, service и route по README. Для тестового подключения ниже это автоматизирует bootstrap-скрипт.
 
 ## 6. Привязка Telegram webhook
 
-После создания connection зарегистрируйте webhook через Telegram Bot API, указав:
+После получения токена Telegram внесите `TELEGRAM_BOT_TOKEN` в `.env`. Чтобы API и worker получили изменённые переменные, пересоздайте их:
+
+```bash
+nano .env
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.vps.yml \
+  up -d --force-recreate api worker
+```
+
+Если после запуска менялся также `CALLBACK_SHARED_KEY`, пересоздайте и `demo`.
+
+Проверенный способ зарегистрировать все тестовые объекты и webhook одним скриптом:
+
+```bash
+python3 scripts/bootstrap_telegram.py
+```
+
+Скрипт проверяет Telegram-токен, создаёт workspace, connection, service и три маршрута (`message.received`, `file.received`, `callback.received`), вызывает Telegram `setWebhook` и проверяет `getWebhookInfo`. UUID сохраняются в `.local/telegram_bootstrap.json` (исключён из Git), чтобы при повторном запуске использовать существующие записи. Секреты берутся из `.env`, а не выводятся в консоль.
+
+Альтернативно webhook можно зарегистрировать вручную через Telegram Bot API, указав:
 
 ```text
 URL = https://proxy.handyman.moscow/v1/webhooks/telegram/CONNECTION_UUID
@@ -112,7 +173,18 @@ docker compose -f docker-compose.yml -f docker-compose.vps.yml exec postgres \
   psql -U eventhub -d eventhub -c "SELECT event_type, received_at FROM relay.event_log ORDER BY received_at DESC LIMIT 10"
 ```
 
-Вместо eventhub укажите свои `POSTGRES_USER` и `POSTGRES_DB`. Если события есть, но ответов от бота нет, это ещё не означает неисправность ingress: нужен зарегистрированный service route и/или создание `outbound_command` бизнес-сервисом. В комплекте demo consumer принимает событие, но **не отправляет автоматический echo-ответ**.
+Вместо eventhub укажите свои `POSTGRES_USER` и `POSTGRES_DB`. Для просмотра именно проверенной цепочки Telegram → API → worker → Demo Consumer:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.vps.yml \
+  logs --tail=100 api worker demo
+```
+
+При нормальной доставке в логах есть `POST /v1/webhooks/telegram/... 200 OK`, `DEMO received message.received` и `POST http://demo:8001/events 200 OK`.
+
+Если события есть, но ответов от бота нет, это ещё не означает неисправность ingress: нужен зарегистрированный service route и/или создание `outbound_command` бизнес-сервисом. В комплекте demo consumer принимает событие, но **не отправляет автоматический echo-ответ**. Для проверенного примера исходящей команды, поиска chat_id и проверки статуса см. [`OPERATIONS.md`](OPERATIONS.md).
 
 Для обновления кода: `git pull`, затем снова `docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build`. Для данных PostgreSQL предусмотрен Docker named volume; перед обновлениями схемы делайте резервные копии БД.
 
