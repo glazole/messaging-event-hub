@@ -96,6 +96,46 @@ docker compose exec -T postgres \
 
 Ожидаются `status=succeeded`, заполненный `provider_message_id` и полученное сообщение в Telegram. Если статус `retry` или `dead`, смотрите `last_error` и логи worker.
 
+### Отдельный Echo Service (опциональный)
+
+`Echo Service` реализован в [`src/eventhub/echo.py`](../src/eventhub/echo.py). Он получает `message.received` через стандартный delivery callback и ставит ответ через ограниченный внутренний `POST /v1/service-replies`, **без ADMIN_API_KEY, Telegram SDK и доступа к токену бота**. Ядро само определяет получателя и connection из исходного события. Ключ идемпотентности привязан к `(service_id, event_id)`, поэтому повторы HTTP-доставки не создают вторую исходящую команду.
+
+Echo **не включён по умолчанию**. Для существующей установки:
+
+```bash
+cd ~/messaging-event-hub
+git pull origin main
+
+# Запустить опциональный контейнер Echo и обновлённый API.
+docker compose -f docker-compose.yml -f docker-compose.vps.yml \
+  --profile echo up -d --build api echo
+
+# Убедиться, что Echo отвечает внутри Compose сети.
+docker compose -f docker-compose.yml -f docker-compose.vps.yml \
+  --profile echo ps
+
+# Зарегистрировать только новые service_endpoint и event_route.
+python3 scripts/register_echo.py
+
+# Посмотреть принятие событий и постановку ответов в очередь.
+docker compose -f docker-compose.yml -f docker-compose.vps.yml \
+  --profile echo logs --tail=100 api worker echo
+```
+
+После регистрации отправьте **новое** текстовое сообщение тестовому Telegram-боту: Echo ответит `Эхо: <текст>`. Демонстрационный сервис при этом продолжит получать то же событие. Ранее принятые события не воспроизводятся автоматически. Echo не отвечает на вложения и события без текста.
+
+Проверка очереди:
+
+```bash
+docker compose exec -T postgres psql -U eventhub -d eventhub -c \
+  "SELECT command_type, status, attempts, provider_message_id, last_error
+   FROM relay.outbound_commands ORDER BY available_at DESC LIMIT 5;"
+```
+
+**Отключение автоответов:** сначала отключите Echo route (`relay.event_routes.is_enabled=false` для ID `echo_route_id` из `.local/telegram_bootstrap.json`) через административную операцию с БД, затем можно остановить контейнер `echo`. **Не останавливайте Echo первым при активном маршруте**, иначе worker будет безуспешно повторять доставку. Для простого временного теста бот продолжит отвечать, пока маршрут активен и сервис запущен.
+
+В текущем MVP `X-Hub-Key` общий для тестовых demo/echo-подключений; это допустимо только для доверенного лабораторного контура, не полноценная модель разграничения клиентских сервисов.
+
 ## 4. Очередь и диагностика
 
 Внутри контейнера PostgreSQL:
