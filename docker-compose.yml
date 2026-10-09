@@ -1,0 +1,53 @@
+x-app: &app
+  build: .
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+  migrate:
+    <<: *app
+    command: ["alembic","upgrade","head"]
+    restart: "no"
+    networks: [internal]
+  api:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [internal]
+  worker:
+    <<: *app
+    command: ["python","-m","eventhub.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal]
+  demo:
+    <<: *app
+    command: ["uvicorn","eventhub.demo:app","--host","0.0.0.0","--port","8001"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [internal]
+volumes:
+  pgdata:
+networks:
+  internal:
