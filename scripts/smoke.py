@@ -29,7 +29,7 @@ for _ in range(60):
         with urllib.request.urlopen(BASE + "/health/ready", timeout=3) as r:
             if r.status == 200:
                 break
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         pass
     time.sleep(2)
 else:
