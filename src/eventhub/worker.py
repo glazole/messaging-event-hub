@@ -13,7 +13,17 @@ from eventhub.core import resolve_secret
 from eventhub.adapters.telegram import TelegramAdapter
 
 logging.basicConfig(level=logging.INFO)
+# HTTPX logs complete request URLs at INFO. Telegram Bot API puts the token
+# in the URL path, so those logs MUST remain disabled.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("eventhub.worker")
+
+
+def redact_secret(value: str, secret: str | None) -> str:
+    """Prevent Telegram credentials being persisted in last_error on failures."""
+    return value.replace(secret, "[REDACTED]") if secret else value
+
 WORKER_ID = socket.gethostname() + "-" + str(os.getpid())
 
 async def claim(model):
@@ -90,6 +100,7 @@ async def deliver(item_id):
         await finish(EventDelivery, item_id, False, str(ex), permanent=permanent)
 
 async def send(item_id):
+    token = None
     try:
         async with Session() as db:
             cmd = await db.get(OutboundCommand, item_id)
@@ -108,7 +119,8 @@ async def send(item_id):
             not isinstance(ex, httpx.HTTPStatusError) or
             (400 <= ex.response.status_code < 500 and ex.response.status_code != 429))
         log.warning("Outbound %s failed: %s", item_id, type(ex).__name__)
-        await finish(OutboundCommand, item_id, False, str(ex), permanent=permanent)
+        await finish(OutboundCommand, item_id, False,
+                     redact_secret(str(ex), token), permanent=permanent)
 
 async def run():
     if settings.worker_lease_seconds <= settings.http_timeout_seconds * 2:
