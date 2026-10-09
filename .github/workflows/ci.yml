@@ -25,6 +25,16 @@ jobs:
       CALLBACK_SHARED_KEY: smoke_demo_callback_key
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare CI environment
+        run: |
+          cat > .env <<EOF
+          POSTGRES_DB=$POSTGRES_DB
+          POSTGRES_USER=$POSTGRES_USER
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          DATABASE_URL=$DATABASE_URL
+          ADMIN_API_KEY=$ADMIN_API_KEY
+          CALLBACK_SHARED_KEY=$CALLBACK_SHARED_KEY
+          EOF
       - name: Compose build and start
         run: |
           docker compose up -d --build
