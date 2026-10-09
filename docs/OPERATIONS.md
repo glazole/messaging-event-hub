@@ -26,6 +26,76 @@ curl -sS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 
 Секрет проверяется из `X-Telegram-Bot-Api-Secret-Token`. Регистрация webhook и Token должны соответствовать **одному и тому же** Telegram-боту. Приложение отвечает 200 лишь после commit событий и доставок.
 
+### Функциональная проверка входящего и исходящего Telegram
+
+После `python3 scripts/bootstrap_telegram.py` отправьте боту `/start` и проверьте API, worker и Demo Consumer:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.vps.yml \
+  logs --tail=100 api worker demo
+```
+
+Ожидаются HTTP 200 для Telegram webhook и Demo Consumer. Найдите `chat_id` в сохранённых событиях:
+
+```bash
+docker compose exec -T postgres \
+  psql -U eventhub -d eventhub -c \
+  "SELECT event_type,
+          payload->>'conversation_id' AS chat_id,
+          received_at
+   FROM relay.event_log
+   ORDER BY received_at DESC
+   LIMIT 5;"
+```
+
+Чтобы отправить ответ **через очередь Event Hub**, в следующей команде замените `TELEGRAM_CHAT_ID` на полученный `chat_id`:
+
+```bash
+python3 - <<'PY'
+import sys
+import uuid
+
+sys.path.insert(0, "scripts")
+from bootstrap_telegram import load_env, read_state, local_post
+
+chat_id = "TELEGRAM_CHAT_ID"  # замените на результат SQL-запроса
+
+result = local_post(
+    "/v1/outbound",
+    {
+        "connection_id": read_state()["connection_id"],
+        "command_type": "message.send",
+        "idempotency_key": f"telegram-test-{uuid.uuid4()}",
+        "target": {"conversation_id": chat_id},
+        "payload": {
+            "text": "Messaging Event Hub: исходящая доставка работает."
+        },
+    },
+    load_env()["ADMIN_API_KEY"],
+)
+
+print(result)
+PY
+```
+
+`local_post` обращается к закрытому локальному административному API и берёт его ключ из `.env`. Ответ `{"command_id":"…","created":true}` подтверждает **постановку в очередь**, а не доставку. В данной конструкции `python3 - <<'PY'` не следует использовать `input()`: стандартный ввод занят heredoc.
+
+Проверка фактической отправки:
+
+```bash
+docker compose exec -T postgres \
+  psql -U eventhub -d eventhub -c \
+  "SELECT id, command_type, status, attempts,
+          provider_message_id, last_error
+   FROM relay.outbound_commands
+   ORDER BY available_at DESC
+   LIMIT 5;"
+```
+
+Ожидаются `status=succeeded`, заполненный `provider_message_id` и полученное сообщение в Telegram. Если статус `retry` или `dead`, смотрите `last_error` и логи worker.
+
 ## 4. Очередь и диагностика
 
 Внутри контейнера PostgreSQL:
