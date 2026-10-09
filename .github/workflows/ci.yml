@@ -39,6 +39,9 @@ jobs:
         run: |
           docker compose up -d --build
           docker compose ps
+          docker compose logs migrate
+          docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM relay.alembic_version"
+          docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\\dt relay.*"
       - name: Smoke test
         run: python3 scripts/smoke.py
       - name: Logs on failure
