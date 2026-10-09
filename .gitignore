@@ -10,3 +10,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Local deployment progress and identifiers
+.local/
