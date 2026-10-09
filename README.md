@@ -8,6 +8,8 @@
 
 Python 3.12 · FastAPI · SQLAlchemy 2 (async) · asyncpg · PostgreSQL 16 · Alembic · HTTPX · Docker Compose.
 
+**Для VPS с доменом `proxy.handyman.moscow` и Docker:** [пошаговое руководство по публикации через Caddy](docs/VPS_DEPLOY.md). Дополнительный файл `docker-compose.vps.yml` открывает наружу только HTTPS webhook, не административное API.
+
 ## Первый запуск
 
 ```bash

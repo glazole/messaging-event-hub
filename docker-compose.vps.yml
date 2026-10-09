@@ -1,0 +1,22 @@
+# Дополнение к docker-compose.yml только для VPS с публичными 80/443.
+# Использование: docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+services:
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - internal
+
+volumes:
+  caddy_data:
+  caddy_config:

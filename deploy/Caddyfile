@@ -1,0 +1,17 @@
+# Публичен только Telegram webhook. Административный API остаётся на loopback.
+# Caddy автоматически выпускает и продлевает сертификат Let's Encrypt/ZeroSSL,
+# когда A-запись домена указывает на сервер и доступны входящие 80/443 TCP.
+proxy.handyman.moscow {
+    @telegram_webhook {
+        method POST
+        path /v1/webhooks/telegram/*
+    }
+
+    handle @telegram_webhook {
+        reverse_proxy api:8000
+    }
+
+    handle {
+        respond "Not Found" 404
+    }
+}
