@@ -21,7 +21,7 @@ def test_message_contract():
 @pytest.mark.parametrize("message", [
     {"type": "file", "text": "abc"},
     {"type": "text", "text": ""},
-    {"type": "text", "text": "x" * 4001},
+    {"type": "text", "text": "x" * 4097},
 ])
 def test_reject_invalid_messages(message):
     with pytest.raises(ValidationError):
