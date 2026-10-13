@@ -20,8 +20,81 @@ Business services can run on another VM later; **no file worker or S3 is deploye
 Returns HTTP 202: `{"command_id":"UUID","created":true}`. This is **queued**, not delivered.
 Same service, connection and idempotency key with identical content returns `created:false`.
 Reusing a key with changed content returns HTTP 409. The key is scoped to the service.
-Currently the v0.2 contract supports **text only**. File sending exists only in legacy admin
-outbound as `file.send`; media/S3 contract will be designed with the separate file module.
+The contract now supports typed messages: text, media (document/photo/video/audio/voice/animation),
+inline keyboards, edit_text, and callback_answer. Media sources include telegram_file_id and
+HTTPS URLs. The storage_ref format is reserved for future S3 integration but is deliberately
+rejected with HTTP 422 until a secure storage resolver is implemented.
+
+### Rich message payloads
+
+Inline keyboard:
+
+```json
+{"connection_key":"telegram-test","idempotency_key":"menu-001",
+ "target":{"conversation_id":"123456789"},
+ "message":{"type":"text","text":"Выберите действие",
+  "buttons":[[{"text":"Запустить","callback_data":"run:123"},
+              {"text":"Открыть","url":"https://example.org"}]]}}
+```
+
+File/photo/video/audio/voice/animation:
+
+```json
+{"connection_key":"telegram-test","idempotency_key":"report-001",
+ "target":{"conversation_id":"123456789"},
+ "message":{"type":"media","media":{"kind":"document",
+  "source":{"type":"telegram_file_id","file_id":"TELEGRAM_FILE_ID"},
+  "caption":"Результат проверки"}}}
+```
+
+Supported source alternatives:
+`{"type":"https_url","url":"https://example.org/report.pdf"}` (Telegram fetches the
+HTTPS asset; never assume a private S3 URL is accessible), or the **future**
+`{"type":"storage_ref","storage_key":"results","object_key":"jobs/123/report.pdf",
+"version_id":"optional"}`. No local filesystem paths, arbitrary s3:// strings, credentials,
+or uploading bytes through Event Hub API.
+
+Callback acknowledgement (callback_id comes from received `callback.received`):
+
+```json
+{"connection_key":"telegram-test","idempotency_key":"cb-42",
+ "target":{"conversation_id":"123456789"},
+ "message":{"type":"callback_answer","callback_id":"CALLBACK_ID",
+            "text":"Принято","show_alert":false}}
+```
+
+Message edit:
+
+```json
+{"connection_key":"telegram-test","idempotency_key":"edit-42",
+ "target":{"conversation_id":"123456789"},
+ "message":{"type":"edit_text","message_id":77,"text":"Готово"}}
+```
+
+`callback_data` must be 1-64 UTF-8 bytes; buttons may contain HTTPS links.
+Out-of-scope for this release: albums, reply keyboards, media editing, reactions,
+polls, message deletion, file bytes ingestion, storage resolver and larger uploads.
+Media limits remain provider-dependent. No capability fallback: unsupported media
+must fail explicitly rather than silently be sent as text.
+
+### Inbound normalized events
+
+`message.received` for text. `file.received` for recognized Telegram media.
+Legacy `payload.attachment` is retained, alongside a new `attachments` array:
+`[{"kind":"document","provider":"telegram","metadata":{"file_id":"..."}}]`.
+For Telegram photos, the largest entry is selected. These are Telegram metadata,
+not S3 objects and not downloaded file bytes. The original Telegram payload stays in
+`event_log.raw_payload`.
+`callback.received` contains `callback_id`, `data`, `actor_id`,
+`conversation_id`, and `message_id`. The receiving business service decides
+whether and when to issue `callback_answer` / `edit_text`.
+Existing routes by event type continue to work; new file consumer needs a
+`file.received` route. No events are replayed on route creation.
+
+**Provider constraints:** Telegram file IDs are bot-specific. An HTTP URL must be
+reachable by Telegram; security policies should allowlist media hosting origins
+before exposing remote-VM integrations. This release does not automatically
+fetch user-submitted Telegram media or push it into S3.
 
 The service is identified from a confidential Bearer secret stored in environment variables
 and referenced from `relay.service_endpoints.publish_secret_ref`. Never send a service_key
@@ -124,8 +197,9 @@ Later: the file module registers as a distinct service in the same workspace,
 receives normalized events via `POST /events` over a private network,
 downloads/stores/processes files with its own S3, and publishes results through
 `POST /v1/messages` using its own Bearer token and explicit connection grant.
-S3 file ingestion, callback auth hardening, media outbound contract and reverse
-proxy private ingress require separate design and implementation.
+S3 file ingestion, storage_ref resolution, callback auth hardening, and reverse
+proxy private ingress require separate implementation. The media/button JSON
+contract itself is now part of Event Hub v0.2.
 Telegram webhook stays on the Dutch VPS at its existing URL.
 
 ## Security notes
