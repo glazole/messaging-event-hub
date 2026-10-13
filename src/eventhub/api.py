@@ -6,7 +6,7 @@ import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from eventhub.config import settings
 from eventhub.db import Session, engine
@@ -137,6 +137,8 @@ async def create_route(body: RouteIn):
         service = await session.get(ServiceEndpoint, body.service_id)
         if not service or service.workspace_id != body.workspace_id:
             raise HTTPException(422, "Service workspace mismatch")
+        if not service.callback_url:
+            raise HTTPException(422, "Service has no callback URL")
         if body.connection_id:
             connection = await session.get(ChannelConnection, body.connection_id)
             if not connection or connection.workspace_id != body.workspace_id:
@@ -200,6 +202,9 @@ async def publish_message(body: MessageIn, authorization: str | None = Header(de
         service, connection = authorized[0]
         # Namespace deduplication by publisher so independent services cannot collide.
         scoped_key = "svc:" + str(service.id) + ":" + hashlib.sha256(body.idempotency_key.encode()).hexdigest()
+        # Transaction-scoped per-key lock prevents concurrent conflicting writes.
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                              {"key": str(connection.id) + ":" + scoped_key})
         existing = (await session.execute(select(OutboundCommand).where(
             OutboundCommand.connection_id == connection.id,
             OutboundCommand.idempotency_key == scoped_key
