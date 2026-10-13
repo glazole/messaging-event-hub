@@ -16,6 +16,11 @@ def upgrade():
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     service_cols = {c["name"] for c in inspector.get_columns("service_endpoints", schema="relay")}
+    if "callback_url" in service_cols:
+        callback_column = next(c for c in inspector.get_columns("service_endpoints", schema="relay") if c["name"] == "callback_url")
+        if not callback_column["nullable"]:
+            op.alter_column("service_endpoints", "callback_url", schema="relay",
+                            existing_type=sa.Text(), nullable=True)
     if "publish_secret_ref" not in service_cols:
         op.add_column("service_endpoints", sa.Column("publish_secret_ref", sa.String(255), nullable=True), schema="relay")
     outbound_cols = {c["name"] for c in inspector.get_columns("outbound_commands", schema="relay")}
