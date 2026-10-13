@@ -1,6 +1,10 @@
-"""Telegram HTTP Bot API adapter; no Telegram dependency in the event router."""
+"""Telegram adapter: provider-specific conversions stay outside business contracts."""
 import hmac
 import httpx
+
+
+MEDIA_FIELDS = ("document", "photo", "video", "audio", "voice", "animation", "video_note", "sticker")
+
 
 class TelegramAdapter:
     provider_key = "telegram"
@@ -16,15 +20,25 @@ class TelegramAdapter:
             raise ValueError("Telegram update_id обязателен")
         if "message" in update:
             message = update["message"]
-            kind = "file.received" if ("document" in message or "photo" in message) else "message.received"
+            attachments = []
+            for field in MEDIA_FIELDS:
+                if field not in message:
+                    continue
+                entry = message[field]
+                if field == "photo" and isinstance(entry, list):
+                    entry = entry[-1] if entry else {}
+                attachments.append({"kind": field, "provider": "telegram", "metadata": entry})
             payload = {
                 "actor_id": str(message.get("from", {}).get("id", "")),
                 "conversation_id": str(message.get("chat", {}).get("id", "")),
                 "message_id": str(message.get("message_id", "")),
                 "text": message.get("text") or message.get("caption"),
                 "attachment": message.get("document") or message.get("photo"),
+                "attachments": attachments,
+                "schema_version": 2,
+                "reply_to_message_id": str(message.get("reply_to_message", {}).get("message_id", "")) or None,
             }
-            return kind, str(update_id), payload
+            return ("file.received" if attachments else "message.received"), str(update_id), payload
         if "callback_query" in update:
             callback = update["callback_query"]
             message = callback.get("message") or {}
@@ -33,16 +47,34 @@ class TelegramAdapter:
                 "data": callback.get("data"),
                 "actor_id": str(callback.get("from", {}).get("id", "")),
                 "conversation_id": str(message.get("chat", {}).get("id", "")),
+                "message_id": str(message.get("message_id", "")),
+                "schema_version": 2,
             }
         return "telegram.update", str(update_id), {"unsupported": True}
 
     @staticmethod
     async def send(token: str, command_type: str, target: dict, payload: dict):
-        method = {"message.send": "sendMessage", "file.send": "sendDocument",
-                  "message.edit": "editMessageText", "callback.answer": "answerCallbackQuery"}.get(command_type)
+        methods = {"message.send": "sendMessage", "file.send": "sendDocument",
+                   "message.edit": "editMessageText", "callback.answer": "answerCallbackQuery"}
+        if command_type == "media.send":
+            methods["media.send"] = {
+                "document": "sendDocument", "photo": "sendPhoto", "video": "sendVideo",
+                "audio": "sendAudio", "voice": "sendVoice", "animation": "sendAnimation"
+            }.get(payload.get("kind"))
+        method = methods.get(command_type)
         if not method:
             raise ValueError("Unsupported command type: " + command_type)
         args = dict(payload)
+        args.pop("kind", None)
+        if command_type == "media.send":
+            src = args.pop("source")
+            if src["type"] == "storage_ref":
+                raise ValueError("Storage resolver not yet configured")
+            if src["type"] not in ("telegram_file_id", "https_url"):
+                raise ValueError("Unsupported media source")
+            field = {"sendDocument":"document","sendPhoto":"photo","sendVideo":"video",
+                     "sendAudio":"audio","sendVoice":"voice","sendAnimation":"animation"}[method]
+            args[field] = src["file_id"] if src["type"] == "telegram_file_id" else src["url"]
         if method != "answerCallbackQuery":
             if "conversation_id" not in target:
                 raise ValueError("target.conversation_id required")
