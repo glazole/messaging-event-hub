@@ -143,6 +143,57 @@ to the internet as-is. A future remote VM requires a private overlay
 (Tailscale/WireGuard), HTTPS/mTLS or equivalent trusted link, and IP/egress controls.
 Use a private-network ingress to the Event Hub API on the Dutch VPS.
 
+### Universal registration CLI
+
+Use `scripts/register_service.py` from the repository root on the Event Hub VPS.
+It uses the private local admin API (`127.0.0.1:8000`), reads `ADMIN_API_KEY` and
+secret references from `.env`, and defaults to the Telegram test workspace/connection
+IDs in `.local/telegram_bootstrap.json`. It never prints secrets.
+
+Create a publish-only service (generate `TEST_SENDER_PUBLISH_KEY` with
+`openssl rand -hex 32` first; add it to `.env` and recreate the `api`
+container so the environment variable is available):
+
+```bash
+python3 scripts/register_service.py \\
+  --service-key test-sender \\
+  --publish-secret-env TEST_SENDER_PUBLISH_KEY \\
+  --grant-publish
+```
+
+For an independent consumer with receiving routes and outbound access:
+
+```bash
+python3 scripts/register_service.py \\
+  --service-key file-processor \\
+  --callback-url https://processor.internal.example/events \\
+  --callback-secret-env FILE_PROCESSOR_CALLBACK_KEY \\
+  --publish-secret-env FILE_PROCESSOR_PUBLISH_KEY \\
+  --grant-publish \\
+  --route file.received \\
+  --route callback.received
+```
+
+Specify `--workspace-id UUID` and repeat `--connection-id UUID` to target
+other existing workspaces/connections. With no explicit connection IDs, it uses
+the Telegram bootstrap connection for grants and routes.
+
+The utility saves UUIDs atomically with restrictive permissions in
+`.local/registered_services.json`, separate from Telegram bootstrap state.
+Re-running **with the exact same arguments** reuses local IDs. Do not delete
+the local state: API service creation currently has no idempotent upsert, so
+an already existing service not tracked by the utility needs its ID manually
+reconciled before retrying. The tool does not overwrite or change existing
+service definitions or re-enable disabled publish grants. To reuse the existing
+`test-sender` created earlier via the one-off bootstrap snippet, do not
+blindly run the CLI with that name; use a new key or reconcile the existing
+record with the local registration state.
+
+Existing `.env` secret values must be strong and available inside the Event
+Hub API container; changing the file alone is not enough. No Compose restart
+or token generation occurs automatically. Remote callbacks require protected
+networking, and the script does not expose any new public endpoint.
+
 ## Backward compatibility and database migration
 
 - Existing `POST /v1/service-replies` and `POST /v1/outbound` keep working.
