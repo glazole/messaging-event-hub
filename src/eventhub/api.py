@@ -13,6 +13,7 @@ from eventhub.db import Session, engine
 from eventhub.models import Workspace, ChannelConnection, ServiceEndpoint, EventRoute, EventRecord, EventDelivery, ServicePublishGrant, OutboundCommand
 from eventhub.core import publish, queue_outbound, resolve_secret
 from eventhub.adapters.telegram import TelegramAdapter
+from eventhub.message_contract import MessageIn, queue_command
 
 @asynccontextmanager
 async def lifespan(app):
@@ -21,7 +22,7 @@ async def lifespan(app):
     yield
     await engine.dispose()
 
-app = FastAPI(title="Messaging Event Hub", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Messaging Event Hub", version="0.2.0", lifespan=lifespan)
 
 def admin(x_admin_key: str | None = Header(default=None)):
     import hmac
@@ -56,22 +57,6 @@ class RouteIn(BaseModel):
 class PublishGrantIn(BaseModel):
     service_id: uuid.UUID
     connection_id: uuid.UUID
-
-
-class MessageTarget(BaseModel):
-    conversation_id: str = Field(min_length=1, max_length=255)
-
-
-class TextMessage(BaseModel):
-    type: str = Field(pattern="^text$")
-    text: str = Field(min_length=1, max_length=4000)
-
-
-class MessageIn(BaseModel):
-    connection_key: str = Field(min_length=2, max_length=100)
-    idempotency_key: str = Field(min_length=1, max_length=150)
-    target: MessageTarget
-    message: TextMessage
 
 
 class ServiceReplyIn(BaseModel):
@@ -210,14 +195,17 @@ async def publish_message(body: MessageIn, authorization: str | None = Header(de
             OutboundCommand.idempotency_key == scoped_key
         ))).scalar_one_or_none()
         target = body.target.model_dump()
-        payload = {"text": body.message.text}
+        try:
+            command_type, payload = queue_command(body.message)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         if existing:
-            if (existing.source_service_id != service.id or existing.command_type != "message.send"
+            if (existing.source_service_id != service.id or existing.command_type != command_type
                     or existing.target != target or existing.payload != payload):
                 raise HTTPException(409, "Idempotency key reused with different content")
             return {"command_id": str(existing.id), "created": False}
         command_id, created = await queue_outbound(
-            session, connection, scoped_key, "message.send", target, payload
+            session, connection, scoped_key, command_type, target, payload
         )
         if created:
             cmd = await session.get(OutboundCommand, command_id)
