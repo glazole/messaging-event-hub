@@ -4,6 +4,40 @@
 
 > Версия 0.1 — инженерный MVP. Не заявляет exactly-once delivery или готовность к публичному SaaS без усиления безопасности и нагрузочных испытаний.
 
+## Новый сервисный API v0.2 (аддитивный)
+
+Для бизнес-сервисов добавлен **`POST /v1/messages`** с Bearer-токеном
+сервиса, разрешением на конкретное подключение через
+`POST /v1/publish-grants` и изоляцией ключей идемпотентности.
+Новые сервисы могут быть только издателями без callback URL.
+Сейчас публичный контракт поддерживает **текстовые сообщения**.
+
+```http
+POST /v1/messages
+Authorization: Bearer <SERVICE_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "connection_key": "telegram-test",
+  "idempotency_key": "i17-validation-98765",
+  "target": {"conversation_id": "123456789"},
+  "message": {"type": "text", "text": "Проверка завершена"}
+}
+```
+
+Результат HTTP 202: `{"command_id":"UUID","created":true}` означает постановку
+в очередь, не факт доставки. Токен сервиса хранится в переменной окружения
+на стороне Event Hub и передаётся только в заголовке; в БД сохраняется
+`publish_secret_ref: env://SERVICE_SECRET_NAME`.
+
+**Обязательно прочитай [документацию контракта и безопасной миграции](docs/SERVICE_MESSAGES_API.md)
+до обновления VPS**. Старые сообщения, Telegram webhook и Echo не затрагиваются.
+`/v1/messages` не публиковать напрямую в интернет. Для будущего обработчика
+на другом VPS потребуется отдельная защищённая сеть; размещение webhook остаётся
+на голландском VPS.
+
 ## Стек
 
 Python 3.12 · FastAPI · SQLAlchemy 2 (async) · asyncpg · PostgreSQL 16 · Alembic · HTTPX · Docker Compose.
