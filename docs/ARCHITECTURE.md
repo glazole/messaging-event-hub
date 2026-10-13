@@ -130,27 +130,30 @@ erDiagram
 
 ```mermaid
 sequenceDiagram
-  participant T as Telegram
-  participant A as Adapter / API
-  participant P as PostgreSQL
-  participant W as Worker
-  participant S as Business Service
-  T->>A: POST /webhooks/telegram/UUID
-  A->>A: secret + update_id validation
-  A->>P: BEGIN; INSERT event; INSERT deliveries
-  P-->>A: COMMIT
-  A-->>T: HTTP 200
-  W->>P: claim deliveries (SKIP LOCKED)
-  P-->>W: job leased
-  W->>S: POST event + X-Delivery-Id
-  S-->>W: HTTP 2xx
-  W->>P: status=succeeded
-  S->>A: POST /v1/outbound
-  A->>P: INSERT outbound command
-  W->>P: claim command
-  W->>T: sendMessage via Bot API
-  T-->>W: message id
-  W->>P: status=succeeded
+    participant T as Telegram
+    participant A as Adapter / API
+    participant P as PostgreSQL
+    participant W as Worker
+    participant S as Business Service
+
+    T->>A: POST /webhooks/telegram/UUID
+    A->>A: secret + update_id validation
+    A->>P: BEGIN, INSERT event, INSERT deliveries
+    P-->>A: COMMIT
+    A-->>T: HTTP 200
+
+    W->>P: claim deliveries (SKIP LOCKED)
+    P-->>W: job leased
+    W->>S: POST event + X-Delivery-Id
+    S-->>W: HTTP 2xx
+    W->>P: status=succeeded
+
+    S->>A: POST /v1/outbound
+    A->>P: INSERT outbound command
+    W->>P: claim command
+    W->>T: sendMessage via Bot API
+    T-->>W: message id
+    W->>P: status=succeeded
 ```
 
 ## Гарантии и риски
