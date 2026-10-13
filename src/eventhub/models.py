@@ -41,8 +41,10 @@ class ServiceEndpoint(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uid)
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("relay.workspaces.id"))
     service_key: Mapped[str] = mapped_column(String(100))
-    callback_url: Mapped[str] = mapped_column(Text)
+    callback_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     auth_secret_ref: Mapped[str | None] = mapped_column(String(255))
+    # Separate credential for service-initiated API calls; no plaintext tokens in DB.
+    publish_secret_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=10)
 
@@ -55,6 +57,17 @@ class EventRoute(Base):
     connection_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("relay.channel_connections.id"))
     event_type: Mapped[str] = mapped_column(String(150))
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class ServicePublishGrant(Base):
+    """Explicit authorization for a service to publish through a connection."""
+    __tablename__ = "service_publish_grants"
+    __table_args__ = (UniqueConstraint("service_id", "connection_id"), {"schema": "relay"})
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uid)
+    service_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("relay.service_endpoints.id"))
+    connection_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("relay.channel_connections.id"))
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 
 class EventRecord(Base):
     __tablename__ = "event_log"
@@ -93,6 +106,10 @@ class OutboundCommand(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uid)
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("relay.workspaces.id"))
     connection_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("relay.channel_connections.id"))
+    # Nullable: all legacy outbound rows predate service identities.
+    source_service_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("relay.service_endpoints.id"), nullable=True
+    )
     idempotency_key: Mapped[str] = mapped_column(String(255))
     correlation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), default=uid)
     command_type: Mapped[str] = mapped_column(String(100))
