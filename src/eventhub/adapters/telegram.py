@@ -35,7 +35,6 @@ class TelegramAdapter:
                 "text": message.get("text") or message.get("caption"),
                 "attachment": message.get("document") or message.get("photo"),
                 "attachments": attachments,
-                "schema_version": 2,
                 "reply_to_message_id": str(message.get("reply_to_message", {}).get("message_id", "")) or None,
             }
             return ("file.received" if attachments else "message.received"), str(update_id), payload
