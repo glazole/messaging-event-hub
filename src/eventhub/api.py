@@ -1,15 +1,19 @@
 """Admin/control-plane и Telegram webhook; ни одного рабочего MAX endpoint."""
 import uuid
+import hmac
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from eventhub.config import settings
 from eventhub.db import Session, engine
-from eventhub.models import Workspace, ChannelConnection, ServiceEndpoint, EventRoute, EventRecord, EventDelivery
+from eventhub.models import Workspace, ChannelConnection, ServiceEndpoint, EventRoute, EventRecord, EventDelivery, ServicePublishGrant, OutboundCommand
 from eventhub.core import publish, queue_outbound, resolve_secret
 from eventhub.adapters.telegram import TelegramAdapter
+from eventhub.message_contract import MessageIn, queue_command
 
 @asynccontextmanager
 async def lifespan(app):
@@ -18,7 +22,7 @@ async def lifespan(app):
     yield
     await engine.dispose()
 
-app = FastAPI(title="Messaging Event Hub", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Messaging Event Hub", version="0.2.0", lifespan=lifespan)
 
 def admin(x_admin_key: str | None = Header(default=None)):
     import hmac
@@ -40,14 +44,20 @@ class ConnectionIn(BaseModel):
 class ServiceIn(BaseModel):
     workspace_id: uuid.UUID
     service_key: str
-    callback_url: str
+    callback_url: str | None = None
     auth_secret_ref: str | None = None
+    publish_secret_ref: str | None = None
 
 class RouteIn(BaseModel):
     workspace_id: uuid.UUID
     service_id: uuid.UUID
     connection_id: uuid.UUID | None = None
     event_type: str
+
+class PublishGrantIn(BaseModel):
+    service_id: uuid.UUID
+    connection_id: uuid.UUID
+
 
 class ServiceReplyIn(BaseModel):
     # Narrow-scoped business reply: one response per event/service.
@@ -97,7 +107,7 @@ async def create_connection(body: ConnectionIn):
 
 @app.post("/v1/services", dependencies=[Depends(admin)])
 async def create_service(body: ServiceIn):
-    if not body.callback_url.startswith("http://") and not body.callback_url.startswith("https://"):
+    if body.callback_url is not None and not body.callback_url.startswith(("http://", "https://")):
         raise HTTPException(422, "callback_url must use http(s)")
     # Control plane is trusted; never publish it directly on the internet.
     async with Session.begin() as session:
@@ -112,6 +122,8 @@ async def create_route(body: RouteIn):
         service = await session.get(ServiceEndpoint, body.service_id)
         if not service or service.workspace_id != body.workspace_id:
             raise HTTPException(422, "Service workspace mismatch")
+        if not service.callback_url:
+            raise HTTPException(422, "Service has no callback URL")
         if body.connection_id:
             connection = await session.get(ChannelConnection, body.connection_id)
             if not connection or connection.workspace_id != body.workspace_id:
@@ -120,6 +132,86 @@ async def create_route(body: RouteIn):
         session.add(obj)
         await session.flush()
         return {"id": str(obj.id)}
+
+@app.post("/v1/publish-grants", dependencies=[Depends(admin)])
+async def create_publish_grant(body: PublishGrantIn):
+    async with Session.begin() as session:
+        service = await session.get(ServiceEndpoint, body.service_id)
+        connection = await session.get(ChannelConnection, body.connection_id)
+        if not service or not connection or service.workspace_id != connection.workspace_id:
+            raise HTTPException(422, "Service/connection workspace mismatch")
+        existing = (await session.execute(select(ServicePublishGrant).where(
+            ServicePublishGrant.service_id == body.service_id,
+            ServicePublishGrant.connection_id == body.connection_id
+        ))).scalar_one_or_none()
+        if existing:
+            return {"id": str(existing.id), "created": False, "enabled": existing.is_enabled}
+        grant = ServicePublishGrant(service_id=body.service_id, connection_id=body.connection_id)
+        session.add(grant)
+        await session.flush()
+        return {"id": str(grant.id), "created": True, "enabled": True}
+
+
+@app.post("/v1/messages", status_code=202)
+async def publish_message(body: MessageIn, authorization: str | None = Header(default=None)):
+    """Service-scoped outbound publication; never accepts arbitrary provider methods."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Bearer token required")
+    token = authorization[7:]
+    if len(token) < 32 or len(token) > 1024:
+        raise HTTPException(401, "Invalid bearer token")
+    async with Session.begin() as session:
+        # Existing MVP stores env references, never plaintext credentials.
+        # Select eligible connections via explicit active grants.
+        candidates = (await session.execute(
+            select(ServiceEndpoint, ChannelConnection)
+            .join(ServicePublishGrant, ServicePublishGrant.service_id == ServiceEndpoint.id)
+            .join(ChannelConnection, ServicePublishGrant.connection_id == ChannelConnection.id)
+            .where(ServicePublishGrant.is_enabled.is_(True),
+                   ServiceEndpoint.is_enabled.is_(True),
+                   ChannelConnection.is_enabled.is_(True),
+                   ChannelConnection.connection_key == body.connection_key)
+        )).all()
+        authorized = []
+        for service, connection in candidates:
+            if not service.publish_secret_ref:
+                continue
+            try:
+                expected = resolve_secret(service.publish_secret_ref)
+            except ValueError:
+                continue
+            if hmac.compare_digest(token, expected):
+                authorized.append((service, connection))
+        if len(authorized) != 1:
+            raise HTTPException(403, "Service unauthorized for connection")
+        service, connection = authorized[0]
+        # Namespace deduplication by publisher so independent services cannot collide.
+        scoped_key = "svc:" + str(service.id) + ":" + hashlib.sha256(body.idempotency_key.encode()).hexdigest()
+        # Transaction-scoped per-key lock prevents concurrent conflicting writes.
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                              {"key": str(connection.id) + ":" + scoped_key})
+        existing = (await session.execute(select(OutboundCommand).where(
+            OutboundCommand.connection_id == connection.id,
+            OutboundCommand.idempotency_key == scoped_key
+        ))).scalar_one_or_none()
+        target = body.target.model_dump()
+        try:
+            command_type, payload = queue_command(body.message)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        if existing:
+            if (existing.source_service_id != service.id or existing.command_type != command_type
+                    or existing.target != target or existing.payload != payload):
+                raise HTTPException(409, "Idempotency key reused with different content")
+            return {"command_id": str(existing.id), "created": False}
+        command_id, created = await queue_outbound(
+            session, connection, scoped_key, command_type, target, payload
+        )
+        if created:
+            cmd = await session.get(OutboundCommand, command_id)
+            cmd.source_service_id = service.id
+        return {"command_id": str(command_id), "created": created}
+
 
 @app.post("/v1/events", dependencies=[Depends(admin)])
 async def ingest_event(body: IngestIn):
